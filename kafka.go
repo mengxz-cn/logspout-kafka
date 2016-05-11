@@ -2,8 +2,11 @@ package kafka
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+        "net"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +16,8 @@ import (
 	"github.com/gliderlabs/logspout/router"
 	"gopkg.in/Shopify/sarama.v1"
 )
+
+var host string
 
 func init() {
 	router.AdapterFactories.Register(NewKafkaAdapter, "kafka")
@@ -38,6 +43,12 @@ func NewKafkaAdapter(route *router.Route) (router.LogAdapter, error) {
 	}
 
 	var err error
+	host, err = getHost(route.Options)
+        if err != nil {
+                return nil, err
+        }
+	fmt.Printf("# used host ip: %s\n", host)
+
 	var tmpl *template.Template
 	if text := os.Getenv("KAFKA_TEMPLATE"); text != "" {
 		tmpl, err = template.New("kafka").Parse(text)
@@ -85,8 +96,9 @@ func (a *KafkaAdapter) Stream(logstream chan *router.Message) {
 		message, err := a.formatMessage(rm)
 		if err != nil {
 			log.Println("kafka:", err)
-			a.route.Close()
-			break
+			//a.route.Close()
+			//break
+			continue
 		}
 
 		a.producer.Input() <- message
@@ -114,6 +126,42 @@ func newConfig() *sarama.Config {
 }
 
 func (a *KafkaAdapter) formatMessage(message *router.Message) (*sarama.ProducerMessage, error) {
+	dockerInfo := DockerInfo{
+		Name:     message.Container.Name,
+		ID:       message.Container.ID,
+		Image:    message.Container.Config.Image,
+		Hostname: message.Container.Config.Hostname,
+	}
+
+	var js []byte
+
+	var jsonMsg map[string]interface{}
+	err := json.Unmarshal([]byte(message.Data), &jsonMsg)
+	if err != nil {
+		// the message is not in JSON make a new JSON message
+		msg := LogstashMessage{
+			Message: message.Data,
+			Docker:  dockerInfo,
+                        Host:	 host,
+		}
+		js, err = json.Marshal(msg)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// the message is already in JSON just add the docker specific fields as a nested structure
+		jsonMsg["docker"] = dockerInfo
+		jsonMsg["host"] = host
+
+		fmt.Println(jsonMsg["host"])
+
+		js, err = json.Marshal(jsonMsg)
+		if err != nil {
+			return nil, err
+		}
+                fmt.Println(string(js))  
+	}
+
 	var encoder sarama.Encoder
 	if a.tmpl != nil {
 		var w bytes.Buffer
@@ -122,7 +170,8 @@ func (a *KafkaAdapter) formatMessage(message *router.Message) (*sarama.ProducerM
 		}
 		encoder = sarama.ByteEncoder(w.Bytes())
 	} else {
-		encoder = sarama.StringEncoder(message.Data)
+		//encoder = sarama.StringEncoder(message.Data)
+		encoder = sarama.StringEncoder(js)
 	}
 
 	return &sarama.ProducerMessage{
@@ -157,5 +206,46 @@ func errorf(format string, a ...interface{}) (err error) {
 	if os.Getenv("DEBUG") != "" {
 		fmt.Println(err.Error())
 	}
-	return
+	return err
+}
+
+func getHost(options map[string]string) (string, error) {
+	host := options["host"]
+        if host == "" {
+                ip, err := getInternal()
+                if err != nil {
+                        return "", err
+                }
+                host = ip
+        }
+	return host, nil
+}
+
+func getInternal() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String(), nil
+			}
+		}
+	}
+	return "", errors.New("no interface addrs")
+}
+
+type DockerInfo struct {
+        Name     string `json:"name"`
+        ID       string `json:"id"`
+        Image    string `json:"image"`
+        Hostname string `json:"hostname"`
+}
+
+// LogstashMessage is a simple JSON input to Logstash.
+type LogstashMessage struct {
+        Message string     `json:"message"`
+        Docker  DockerInfo `json:"docker"`
+	Host string	   `json:"host,omitempty"`
 }
